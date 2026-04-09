@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::any::Any;
 
 lazy_static::lazy_static! {
-    // Vetor global de 512 slots (os "canais todos")
+    // Vetor global de 512 slots
     static ref FULL_SPECTRUM: Mutex<Vec<f32>> = Mutex::new(vec![0.0; 512]);
     static ref CURRENT_STEP: Mutex<usize> = Mutex::new(0);
     static ref FFT_PLAN: Arc<dyn Fft<f32>> = {
