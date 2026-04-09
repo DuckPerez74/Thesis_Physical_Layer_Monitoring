@@ -1,0 +1,14 @@
+# Rust
+/target/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Sistema
+.DS_Store
+Thumbs.db
