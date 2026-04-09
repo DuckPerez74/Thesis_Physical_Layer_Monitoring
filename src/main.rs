@@ -71,7 +71,6 @@ fn main() {
             *skip = 0;
 
             if *step == 0 {
-                // --- LÓGICA DA JANELA DESLIZANTE ---
                 let mut win = WINDOW_BUFFER.lock().unwrap();
                 let mut samples_count = FILLED_SAMPLES.lock().unwrap();
 
@@ -98,7 +97,6 @@ fn main() {
                 }
                 // ----------------------------------------------------
 
-                // Envia para o Python (para continuares a ver a cascata)
                 let bytes: Vec<u8> = spectrum.iter().flat_map(|&f| f.to_le_bytes().to_vec()).collect();
                 let _ = SOCKET.send(&bytes);
             }
