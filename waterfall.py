@@ -2,70 +2,66 @@ import socket
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Configuração do Socket
+# Configurações
 UDP_IP = "127.0.0.1"
 UDP_PORT = 5005
-NUM_SLOTS = 512
 HISTORY_LEN = 150 
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((UDP_IP, UDP_PORT))
 
-
-# Definições da gama física
-f_start = 2400  # MHz
-f_end = 2480    # MHz
-
-# Preparar o gráfico
 plt.ion()
-data_matrix = np.zeros((HISTORY_LEN, NUM_SLOTS))
-fig, ax = plt.subplots(figsize=(12, 7))
+fig, ax = plt.subplots(figsize=(12, 8))
 
-# O parâmetro 'extent' define as etiquetas dos eixos: [esquerda, direita, baixo, cima]
-# Usamos f_start e f_end para o eixo X
-im = ax.imshow(data_matrix, aspect='auto', cmap='magma', animated=True, 
-               interpolation='none', extent=[f_start, f_end, HISTORY_LEN, 0])
+data_matrix = None
+im = None
 
-plt.title("Espectrograma em Tempo Real - Banda Completa Wi-Fi 2.4 GHz")
-plt.xlabel("Frequência (MHz)")
-plt.ylabel("Tempo (Janelas)")
-plt.colorbar(im, label="Intensidade (dB)")
-
-print("A aguardar dados... Certifica-te que o Rust está a correr!")
+print(">>> Python: Visualização do Espectro Sincronizado.")
 
 try:
     while True:
-        packet, addr = sock.recvfrom(4096)
-        
-        # O bloco abaixo tem de estar identado (alinhado à direita)
-        if len(packet) == NUM_SLOTS * 4:
-            # 1. Converter bytes para float e criar cópia editável
+        packet, addr = sock.recvfrom(8192)
+        if len(packet) > 0:
+            # 1. Converter amostras (vêm do Rust)
             new_row = np.frombuffer(packet, dtype=np.float32).copy()
-            
-            # 2. ELIMINAR O DC SPIKE (Ruído central do hardware)
-            center = NUM_SLOTS // 2
-            new_row[center-2 : center+2] = (new_row[center-3] + new_row[center+3]) / 2
+            num_bins = len(new_row)
 
-            # 3. CONVERTER PARA ESCALA LOG (dB)
-            new_row_log = 10 * np.log10(new_row + 1e-6)
+            # --- 2. ADAPTAÇÃO AUTOMÁTICA AO TAMANHO ---
+            if data_matrix is None or data_matrix.shape[1] != num_bins:
+                print(f"Detectados {num_bins} slots. Ajustando matriz...")
+                data_matrix = np.zeros((HISTORY_LEN, num_bins)) - 100
+                if im is not None:
+                    im.remove()
+                # Usamos interpolation='bilinear' para o aspeto fluido e profissional
+                im = ax.imshow(data_matrix, aspect='auto', cmap='magma', 
+                               extent=[2400, 2480, HISTORY_LEN, 0], interpolation='bilinear')
+                plt.title("Espectrograma Sincronizado $P(f,t)$ - 80MHz")
+                plt.xlabel("Frequência (MHz)")
+                plt.ylabel("Tempo (Janelas)")
 
-            # 4. Atualizar Matriz (Efeito de cascata)
+            # --- 3. LIMPEZA LEVE DO DC SPIKE CENTRAL ---
+            # Como o Rust já manda tudo ok, só suavizamos o ponto central exato
+            mid = num_bins // 2
+            new_row[mid-1:mid+2] = np.median(new_row)
+
+            # --- 4. ATUALIZAR MATRIZ COM PERSISTÊNCIA REATIVA ---
+            # 0.5 é um bom equilíbrio: mantém o sinal sólido mas sem arrastamento
+            decay = 0.5
             data_matrix = np.roll(data_matrix, 1, axis=0)
-            data_matrix[0, :] = new_row_log
+            data_matrix[0, :] = (data_matrix[1, :] * decay) + (new_row * (1 - decay))
             
-            # 5. Atualizar Gráfico com Contraste Automático
+            # --- 5. CONTRASTE DINÂMICO (Cores Vivas) ---
             im.set_array(data_matrix)
+            # Definimos o 'preto' no percentil 35 e o 'amarelo' nos picos reais
+            floor = np.percentile(data_matrix, 35)
+            peak = np.percentile(data_matrix, 99.9)
             
-            # Ajustar os limites de cor com base nos percentis (brilho dinâmico)
-            low = np.percentile(data_matrix, 40) # Aumentar para 40 limpa o ruído de fundo
-            high = max(low + 15, np.percentile(data_matrix, 99.9))
-            
-            im.set_clim(vmin=low, vmax=high)
-
+            # Forçamos uma escala que destaca o Wi-Fi sem saturar o ruído
+            im.set_clim(vmin=floor, vmax=max(floor + 10, peak))
             
             plt.pause(0.001)
-            
+
 except KeyboardInterrupt:
-    print("\nCaptura terminada.")
+    print("\nParado pelo utilizador.")
 finally:
     sock.close()

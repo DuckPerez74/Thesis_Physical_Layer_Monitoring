@@ -1,31 +1,23 @@
-use libhackrf::HackRf;
-use num_complex::Complex;
-use rustfft::{FftPlanner, Fft};
+use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader};
 use std::net::UdpSocket;
-use std::sync::{Arc, Mutex};
-use std::any::Any;
-use ndarray::{Array2, s}; // Importamos ndarray para a matriz da janela
+use std::sync::Mutex;
+use ndarray::{Array2, s};
 
-const FREQS: [u64; 4] = [2_412_000_000, 2_432_000_000, 2_452_000_000, 2_472_000_000];
-const FFT_LEN: usize = 1024;
+// --- CONFIGURAÇÕES DA TESE (80 MHz e Janelas) ---
+const START_FREQ: u64 = 2400_000_000;
+const BIN_WIDTH: u64 = 156250; // 80MHz / 512 slots
 const NUM_SLOTS: usize = 512;
-const WINDOW_SIZE: usize = 100; // Tamanho da janela (ex: 100 linhas de tempo)
+const WINDOW_SIZE: usize = 100; // O tamanho da tua Janela Deslizante
 
 lazy_static::lazy_static! {
-    static ref FULL_SPECTRUM: Mutex<Vec<f32>> = Mutex::new(vec![0.0; NUM_SLOTS]);
-    static ref CURRENT_STEP: Mutex<usize> = Mutex::new(0);
-    static ref SKIP_COUNT: Mutex<usize> = Mutex::new(0);
-
-    // --- IMPLEMENTAÇÃO DA JANELA DESLIZANTE ---
-    // Matriz 2D: 100 linhas (tempo) x 512 colunas (frequência)
+    // 1. Buffer para a linha atual que está a ser "cosida"
+    static ref ROW_BUFFER: Mutex<Vec<f32>> = Mutex::new(vec![-100.0; NUM_SLOTS]);
+    
+    // 2. Buffer para a Janela Deslizante (As últimas 100 linhas para as métricas)
     static ref WINDOW_BUFFER: Mutex<Array2<f32>> = Mutex::new(Array2::zeros((WINDOW_SIZE, NUM_SLOTS)));
-    static ref FILLED_SAMPLES: Mutex<usize> = Mutex::new(0);
-    // ------------------------------------------
+    static ref FILLED_ROWS: Mutex<usize> = Mutex::new(0);
 
-    static ref FFT_PLAN: Arc<dyn Fft<f32>> = {
-        let mut planner = FftPlanner::<f32>::new();
-        planner.plan_fft_forward(FFT_LEN)
-    };
     static ref SOCKET: UdpSocket = {
         let s = UdpSocket::bind("127.0.0.1:0").unwrap();
         s.connect("127.0.0.1:5005").unwrap();
@@ -34,74 +26,77 @@ lazy_static::lazy_static! {
 }
 
 fn main() {
-    let mut hackrf = HackRf::open().expect("HackRF não encontrado.");
-    hackrf.set_sample_rate(10_000_000).unwrap(); 
-    let _ = hackrf.set_amp_enable(false);
-    let _ = hackrf.set_lna_gain(32);
-    let _ = hackrf.set_rxvga_gain(40);
+    println!(">>> Motor Rust: Sweep de Hardware + Janela Deslizante ({} amostras)...", WINDOW_SIZE);
 
-    println!("Modo SWEEP + JANELA DESLIZANTE ({} linhas).", WINDOW_SIZE);
+    // Chamamos o hackrf_sweep com os teus parâmetros de ganho do GitHub
+    let mut child = Command::new("hackrf_sweep")
+        .arg("-f").arg("2400:2480")
+        .arg("-w").arg(BIN_WIDTH.to_string())
+        .arg("-l").arg("32") // Ganho LNA do teu GitHub
+        .arg("-g").arg("30") // Ganho VGA do teu GitHub
+        .arg("-a").arg("1")  // Amplificador ligado para detetar vizinhos
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Erro ao iniciar hackrf_sweep");
 
-    hackrf.start_rx(|device, samples: &[Complex<i8>], _user_data: &dyn Any| {
-        let mut skip = SKIP_COUNT.lock().unwrap();
-        if *skip < 5 { *skip += 1; return; }
+    let stdout = child.stdout.take().unwrap();
+    let reader = BufReader::new(stdout);
 
-        let mut buffer: Vec<Complex<f32>> = samples.iter()
-            .take(FFT_LEN)
-            .map(|c| Complex::new(c.re as f32 / 128.0, c.im as f32 / 128.0))
-            .collect();
+    for line in reader.lines() {
+        if let Ok(l) = line {
+            let parts: Vec<&str> = l.split(',').collect();
+            if parts.len() > 6 {
+                let current_low_hz = parts[2].trim().parse::<u64>().unwrap_or(0);
+                
+                // MAPEAMENTO DE FREQUÊNCIA (A solução para as fendas)
+                let start_slot = if current_low_hz > START_FREQ {
+                    ((current_low_hz - START_FREQ) / BIN_WIDTH) as usize
+                } else { 0 };
 
-        if buffer.len() == FFT_LEN {
-            FFT_PLAN.process(&mut buffer);
+                let mut row = ROW_BUFFER.lock().unwrap();
 
-            let mut spectrum = FULL_SPECTRUM.lock().unwrap();
-            let mut step = CURRENT_STEP.lock().unwrap();
+                // Se voltámos ao início, processamos a Janela Deslizante e enviamos ao Python
+                if start_slot == 0 && !row.iter().all(|&x| x == -100.0) {
+                    
+                    // --- LÓGICA DA JANELA DESLIZANTE ---
+                    let mut win = WINDOW_BUFFER.lock().unwrap();
+                    let mut count = FILLED_ROWS.lock().unwrap();
 
-            let start_bin = (FFT_LEN / 2) - 64;
-            let offset = *step * 128;
-            
-            for i in 0..128 {
-                let original_idx = (start_bin + i + FFT_LEN/2) % FFT_LEN;
-                let spec = buffer[original_idx];
-                spectrum[offset + i] = (spec.re.powi(2) + spec.im.powi(2)).sqrt();
-            }
-
-            *step = (*step + 1) % 4;
-            let _ = device.set_freq(FREQS[*step]);
-            *skip = 0;
-
-            if *step == 0 {
-                let mut win = WINDOW_BUFFER.lock().unwrap();
-                let mut samples_count = FILLED_SAMPLES.lock().unwrap();
-
-                if *samples_count < WINDOW_SIZE {
-                    // Caso 1: Ainda a encher a primeira janela (fase inicial)
-                    for s in 0..NUM_SLOTS {
-                        win[[*samples_count, s]] = spectrum[s];
+                    if *count < WINDOW_SIZE {
+                        // Fase inicial: encher a matriz
+                        for s in 0..NUM_SLOTS { win[[*count, s]] = row[s]; }
+                        *count += 1;
+                    } else {
+                        // Janela cheia: DESLIZAR (Shift)
+                        let current_data = win.clone();
+                        win.slice_mut(s![0..WINDOW_SIZE-1, ..])
+                           .assign(&current_data.slice(s![1..WINDOW_SIZE, ..]));
+                        
+                        // Inserir a nova varredura completa na última posição
+                        for s in 0..NUM_SLOTS { win[[WINDOW_SIZE - 1, s]] = row[s]; }
+                        
+                        // AQUI: Já podes chamar a extração de métricas sobre 'win'
+                        // save_metrics_to_csv(&win); 
                     }
-                    *samples_count += 1;
-                } else {
-                    // Caso 2: JANELA DESLIZANTE REAL (Slide)
-                    // 1. Criamos uma cópia temporária para o shift
-                    let win_copy = win.clone();
-                    
-                    // 2. Deslizamos as linhas: a 1 passa a ser a 0, a 2 passa a ser a 1...
-                    // O slice s![1..WINDOW_SIZE, ..] pega nas linhas da 1 à 99
-                    win.slice_mut(s![0..WINDOW_SIZE-1, ..])
-                       .assign(&win_copy.slice(s![1..WINDOW_SIZE, ..]));
-                    
-                    // 3. Inserimos a nova amostra (a mais recente) na última linha (posição 99)
-                    for s in 0..NUM_SLOTS {
-                        win[[WINDOW_SIZE - 1, s]] = spectrum[s];
+
+                    // Enviar a linha para o Python (Gráfico)
+                    let bytes: Vec<u8> = row.iter()
+                        .take(NUM_SLOTS)
+                        .flat_map(|&f| f.to_le_bytes().to_vec())
+                        .collect();
+                    let _ = SOCKET.send(&bytes);
+                }
+
+                // Preencher o ROW_BUFFER com os dados do novo segmento
+                for (i, part) in parts.iter().skip(6).enumerate() {
+                    let idx = start_slot + i;
+                    if idx < NUM_SLOTS {
+                        if let Ok(db) = part.trim().parse::<f32>() {
+                            row[idx] = db;
+                        }
                     }
                 }
-                // ----------------------------------------------------
-
-                let bytes: Vec<u8> = spectrum.iter().flat_map(|&f| f.to_le_bytes().to_vec()).collect();
-                let _ = SOCKET.send(&bytes);
             }
         }
-    }, ()).unwrap();
-
-    loop { std::thread::sleep(std::time::Duration::from_millis(10)); }
+    }
 }
