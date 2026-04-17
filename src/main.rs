@@ -48,7 +48,6 @@ fn pearson_correlation(a: &[f32], b: &[f32]) -> f32 {
     if den == 0.0 { 0.0 } else { num / den }
 }
 
-
 fn extract_features_for_channel(matrix: &Array2<f32>, channel_num: usize, f_start: usize, f_end: usize) {
     let roi = matrix.slice(s![0..WINDOW_SIZE, f_start..f_end]);
     let num_slots_roi = roi.ncols(); 
@@ -56,39 +55,13 @@ fn extract_features_for_channel(matrix: &Array2<f32>, channel_num: usize, f_star
     let mut row_features = Vec::new();
     row_features.push(format!("Canal_{}", channel_num));
 
-    // NOVO: Define o limiar a partir do qual consideramos que "não há transmissão" (Silêncio absoluto)
-    // Podes afinar este valor (ex: -70.0, -75.0, -80.0) de acordo com o teu ambiente
-    let silence_threshold = -75.0; 
-
     // 2. Extrair Métricas Temporais para cada slot do retângulo
     for s_idx in 0..num_slots_roi {
         // AQUI ESTÁ O TEMPO REAL (Cronológico)
         let col_time = roi.column(s_idx).to_vec();
         
-        // --- CÁLCULO DOS SILÊNCIOS NO TEMPO ---
-        let mut silence_count = 0;
-        let mut current_silence_run = 0;
-        let mut max_silence_run = 0;
-
-        for &val in &col_time {
-            if val < silence_threshold {
-                silence_count += 1;
-                current_silence_run += 1;
-                if current_silence_run > max_silence_run {
-                    max_silence_run = current_silence_run;
-                }
-            } else {
-                // Houve um pico/transmissão, interrompe a contagem de silêncio seguido
-                current_silence_run = 0; 
-            }
-        }
-        
-        // Rácio de silêncio: valor de 0.0 (sempre a transmitir) a 1.0 (sempre calado)
-        let silence_ratio = silence_count as f32 / col_time.len() as f32;
-        let max_silence = max_silence_run as f32; // Maior buraco de tempo sem comunicações
-
-        // --- CÁLCULO DAS MÉTRICAS ESTATÍSTICAS (Com ordenação) ---
-        let mut col_sorted = col_time.clone(); // Usamos um clone para não estragar a ordem original
+        // --- 1º PASSO: CÁLCULO DAS ESTATÍSTICAS (Com ordenação) ---
+        let mut col_sorted = col_time.clone(); 
         col_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         
         let len = col_sorted.len() as f32;
@@ -103,7 +76,32 @@ fn extract_features_for_channel(matrix: &Array2<f32>, channel_num: usize, f_star
         let p95 = col_sorted[((len * 0.95) as usize).min(col_sorted.len() - 1)];
         let p99 = col_sorted[((len * 0.99) as usize).min(col_sorted.len() - 1)];
         
-        // Juntamos agora as novas features de silêncio às tuas métricas!
+        // --- 2º PASSO: THRESHOLD DINÂMICO ---
+        // O silêncio é o ruído de fundo (min) mais uma margem de segurança (ex: 7.0 dB).
+        // Qualquer transmissão real vai saltar 15, 20 ou 30 dB acima do ruído.
+        let silence_threshold = min + 7.0; 
+
+        // --- 3º PASSO: CÁLCULO DOS SILÊNCIOS NO TEMPO (Usando o threshold dinâmico) ---
+        let mut silence_count = 0;
+        let mut current_silence_run = 0;
+        let mut max_silence_run = 0;
+
+        for &val in &col_time {
+            if val <= silence_threshold {
+                silence_count += 1;
+                current_silence_run += 1;
+                if current_silence_run > max_silence_run {
+                    max_silence_run = current_silence_run;
+                }
+            } else {
+                current_silence_run = 0; 
+            }
+        }
+        
+        let silence_ratio = silence_count as f32 / len;
+        let max_silence = max_silence_run as f32;
+
+        // --- 4º PASSO: Juntar tudo ---
         for metric in[mean, max, min, median, std_dev, p75, p90, p95, p99, silence_ratio, max_silence] { 
             row_features.push(metric.to_string());
         }
