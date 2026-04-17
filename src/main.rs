@@ -33,7 +33,7 @@ lazy_static::lazy_static! {
 
 
 // =====================================================================
-// FUNÇÕES DE EXTRAÇÃO DE FEATURES (O teu código do TXT adaptado)
+// FUNÇÕES DE EXTRAÇÃO DE FEATURES
 // =====================================================================
 
 fn pearson_correlation(a: &[f32], b: &[f32]) -> f32 {
@@ -48,37 +48,63 @@ fn pearson_correlation(a: &[f32], b: &[f32]) -> f32 {
     if den == 0.0 { 0.0 } else { num / den }
 }
 
+
 fn extract_features_for_channel(matrix: &Array2<f32>, channel_num: usize, f_start: usize, f_end: usize) {
-    // 1. Recortar o Retângulo da Região de Interesse (ex: 100 tempo x 36 freq)
     let roi = matrix.slice(s![0..WINDOW_SIZE, f_start..f_end]);
     let num_slots_roi = roi.ncols(); 
     
     let mut row_features = Vec::new();
-    
-    // Guardar no CSV qual é o canal que estamos a analisar
     row_features.push(format!("Canal_{}", channel_num));
+
+    // NOVO: Define o limiar a partir do qual consideramos que "não há transmissão" (Silêncio absoluto)
+    // Podes afinar este valor (ex: -70.0, -75.0, -80.0) de acordo com o teu ambiente
+    let silence_threshold = -75.0; 
 
     // 2. Extrair Métricas Temporais para cada slot do retângulo
     for s_idx in 0..num_slots_roi {
-        let mut col = roi.column(s_idx).to_vec();
+        // AQUI ESTÁ O TEMPO REAL (Cronológico)
+        let col_time = roi.column(s_idx).to_vec();
         
-        // Ordenar é obrigatório para extrair a mediana e os percentis corretamente
-        col.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // --- CÁLCULO DOS SILÊNCIOS NO TEMPO ---
+        let mut silence_count = 0;
+        let mut current_silence_run = 0;
+        let mut max_silence_run = 0;
+
+        for &val in &col_time {
+            if val < silence_threshold {
+                silence_count += 1;
+                current_silence_run += 1;
+                if current_silence_run > max_silence_run {
+                    max_silence_run = current_silence_run;
+                }
+            } else {
+                // Houve um pico/transmissão, interrompe a contagem de silêncio seguido
+                current_silence_run = 0; 
+            }
+        }
         
-        let len = col.len() as f32;
-        let mean = col.iter().sum::<f32>() / len;
-        let max = *col.last().unwrap_or(&0.0);
-        let min = *col.first().unwrap_or(&0.0);
-        let median = col[col.len() / 2];
-        let std_dev = (col.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / len).sqrt();
+        // Rácio de silêncio: valor de 0.0 (sempre a transmitir) a 1.0 (sempre calado)
+        let silence_ratio = silence_count as f32 / col_time.len() as f32;
+        let max_silence = max_silence_run as f32; // Maior buraco de tempo sem comunicações
+
+        // --- CÁLCULO DAS MÉTRICAS ESTATÍSTICAS (Com ordenação) ---
+        let mut col_sorted = col_time.clone(); // Usamos um clone para não estragar a ordem original
+        col_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         
-        let p75 = col[((len * 0.75) as usize).min(col.len() - 1)];
-        let p90 = col[((len * 0.90) as usize).min(col.len() - 1)];
-        let p95 = col[((len * 0.95) as usize).min(col.len() - 1)];
-        let p99 = col[((len * 0.99) as usize).min(col.len() - 1)];
+        let len = col_sorted.len() as f32;
+        let mean = col_sorted.iter().sum::<f32>() / len;
+        let max = *col_sorted.last().unwrap_or(&0.0);
+        let min = *col_sorted.first().unwrap_or(&0.0);
+        let median = col_sorted[col_sorted.len() / 2];
+        let std_dev = (col_sorted.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / len).sqrt();
         
-        // Adicionar todas as features métricas (as que constam na tua Tabela 4.1 da tese)
-        for metric in[mean, max, min, median, std_dev, p75, p90, p95, p99] { 
+        let p75 = col_sorted[((len * 0.75) as usize).min(col_sorted.len() - 1)];
+        let p90 = col_sorted[((len * 0.90) as usize).min(col_sorted.len() - 1)];
+        let p95 = col_sorted[((len * 0.95) as usize).min(col_sorted.len() - 1)];
+        let p99 = col_sorted[((len * 0.99) as usize).min(col_sorted.len() - 1)];
+        
+        // Juntamos agora as novas features de silêncio às tuas métricas!
+        for metric in[mean, max, min, median, std_dev, p75, p90, p95, p99, silence_ratio, max_silence] { 
             row_features.push(metric.to_string());
         }
     }
@@ -97,7 +123,7 @@ fn extract_features_for_channel(matrix: &Array2<f32>, channel_num: usize, f_star
 }
 
 // =====================================================================
-// MAIN (O teu código original)
+// MAIN
 // =====================================================================
 
 fn main() {
