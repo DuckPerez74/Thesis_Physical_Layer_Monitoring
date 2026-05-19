@@ -1,14 +1,23 @@
-# Rust
-/target/
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
+# Pastas de Compilação e Ambiente
+target/
 venv/
-env/
+__pycache__/
+.vscode/
+.idea/
 
-# Sistema
-.DS_Store
-Thumbs.db
+# Pastas de Backup e ficheiros gigantes (pela tua lista)
+"Wifi Thesis Files/"
+"Wifi-Failed Versions/"
+"Extra Files from different attemps/"
+"Testes/"
+Temp/
+
+# Ficheiros de dados brutos e resultados pesados
+*.csv
+*.npy
+*.pth
+*.gz
+*.pcap
+
+# Manter apenas o necessário (opcional - se quiseres guardar as features processadas)
+# !dataset_features_final.csv
